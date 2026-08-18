@@ -4,72 +4,10 @@
 
 ## Open
 
-- [ ] **Per-app options look dead for App Store apps (2026-08-18, iOS 18.5).**
-  Enabled YouTube Music with `defaults = { idiomMode 2, scale 0.5 }` and no
-  per-app overrides. It launched cleanly on the CarPlay screen with its real
-  phone UI, but at default geometry — none of the settings applied. Evidence
-  that `CSApp.dylib` is not running in it:
-  - There is **no `carsurf.log` in any app container on the device** — only
-    stale `carbridgeng.log` files from the old tweak. `CSLogFilePath` falls
-    back to `NSTemporaryDirectory()` unconditionally, so an injected `CSApp`
-    would have created one.
-  - **No App Store app has ever produced a `[scene/…]` or `[traits/…]` line.**
-    All of them across the whole log come from `Preferences`, `ChargeLimiter`,
-    `TrollStoreLite`, `trollstorehelper` — the apps that can write the shared
-    log. Not one from YouTube, YouTube Music, FPT Play, or Vietmap.
-  - The app renders anyway because the system side does the work: the manifest
-    role spoof gets it a plain `UIWindowSceneSessionRoleApplication`, and the
-    app already declares one. `CSApp` is only needed for idiom/scale/role.
-
-  Two candidates, not yet separated (no `vmmap` on device): `CSApp.dylib` is
-  not injected into App Store apps at all, or it is injected and its log is
-  silently discarded. The second is possible because of a real defect —
-  `CSAppendToFile` (`shared/CSLog.m`) does `if (!file) return;` on a failed
-  `fopen`, and `CSLogFilePath` caches the path under `dispatch_once`. Inside a
-  sandbox `access(W_OK)` can report a shared path writable while the actual
-  `open` is denied, so one failure silences that process for its whole life.
-  **Do that fix first** — fall through to the next path on `fopen` failure. It
-  is worth having regardless, and it answers which of the two this is.
-
-  Until then, Settings advertises Scale / Layout / Interface Idiom for apps
-  where they may do nothing, and the app side is unobservable for exactly the
-  apps the tweak exists for.
-
-- [ ] **The manifest role spoof installs in `carkitd`** — confirmed on device
-  2026-08-18: `[manifest/carkitd] runtime CarPlay launch role spoof installed`.
-  `CSSystem.plist` filters in `carkitd`, and on iOS 18 `CSInstallCarPlayHooks`
-  takes the `else` branch and calls `CSInstallSceneManifestRoleSpoof`, which
-  swizzles `-[LSBundleProxy objectForInfoDictionaryKey:ofClass:]` process-wide.
-  [ios18-runtime-carplay-admission.md](ios18-runtime-carplay-admission.md)
-  lists hooking anything in `carkitd` as a hard rule, because an earlier
-  LS-accessor hook there put the head unit into an endless connecting loop.
-  No loop observed now — this is one string-compare accessor, far lighter than
-  the entitlement spoof that caused it — but it should be gated on the process
-  not being `carkitd`. One line.
-
 - [ ] **Customize list omits CarSurf apps.** The CRS fetch wrapper is off (it
   crashed native CarPlay — see below), so Settings > Customize shows only the
   12 Apple icons; apps still show on the dashboard. Needs a list update that
   preserves the fetched objects instead of rebuilding them.
-- [ ] **First scene after re-enable ignores the display setting — parked, not
-  reproducible (2026-08-17).** Re-enable an app and its CarPlay scene comes up
-  with default geometry instead of the configured interface/aspect. Closing
-  and reopening, or reconnecting CarPlay, fixes it.
-  - Geometry is applied once, in `CSCarSceneConnected` → `CSApplyScaleToCarScene`
-    on `UISceneDidActivateNotification`, guarded by a `seen` set keyed on
-    `scene.session.persistentIdentifier` (`apptweak/CSSceneBridge.m` ~L365). A
-    scene that activates before `coordinateSpace.bounds` is final gets measured
-    once and never re-measured — likely cause.
-  - Options are read fresh per connect (`optionsForBundle:` L328), but idiom is
-    cached per-process by `dispatch_once` in `CSTraits`; queried too early, the
-    whole process builds phone-idiom UI.
-  - Fix ideas: re-apply geometry on a later signal (`didUpdateCoordinateSpace`,
-    first layout pass, or a one-shot next-runloop retry); stop caching the idiom
-    for the process lifetime.
-  - Sandboxed apps can't write the shared log, so their `scene`/`traits` lines
-    are supposed to land in the app container's `tmp/carsurf.log`. As of
-    2026-08-18 **no such file exists for any app**, so this issue may not be
-    separately reproducible until the item above is resolved.
 - [ ] **`multiScene=0`** — `UIApplicationSceneManifest` is missing on iOS 18.5,
   so multi-scene hooks never install. Only single-scene bridging works.
 - [ ] **Dashboard refresh storm** — old `refresh → invalidation → relay updated`
@@ -81,6 +19,99 @@
   still needs a connected-car run.
 
 ## Done — keep the reasoning
+
+- [x] **Geometry never re-applied after a CarPlay reconnect (0.2.4).** This was
+  the real defect behind "first scene ignores the display setting", and the
+  symptom was described backwards in the old entry: reconnecting CarPlay did
+  not *fix* it, reconnecting CarPlay *caused* it. Geometry is applied from
+  `CSCarSceneConnected` on `UISceneDidActivateNotification`, deduped by a set
+  keyed on `scene.session.persistentIdentifier` — and that set was never pruned
+  on disconnect. The identifier is *persistent*, so when a session tears down
+  and comes back the stale entry silently skipped the handler: no geometry, no
+  mirroring, and `gActiveCarScenes` decremented without a matching increment.
+  Only killing the app cleared it, which is exactly why "close and reopen"
+  appeared to be the cure. Fix: the set moved to file scope as
+  `gConfiguredScenes` and `CSCarSceneDisconnected` removes the identifier.
+
+  Device-proven on iphone-11 with a live CarPlay Simulator session, same repro
+  either side of the fix — kill the CarPlay host, then re-launch the app on the
+  display while its process survives:
+  - 0.2.3, app pid 7167 survived: only `car scene disconnected` and `rewriting
+    scene role …`. The role hook fired for the new scene, so it *did* connect,
+    but `car scene connected` never logged.
+  - 0.2.4, app pid 7356 survived: `car scene disconnected` → `car scene
+    connected (mode=1, scale=0.50, layout=1)` → `configured car window to
+    1190x720 at (45,0), 0.50x`.
+
+  Review by Fable raised a fair objection: `CSMarkSessionBridged` has exactly one
+  call site, in the `-[UISceneSession role]` swizzle, and the `rewriting scene
+  role` line comes from the *configuration* hook — so "bailed at
+  `CSIsBridgedCarScene`" and "bailed at the dedupe check" were indistinguishable
+  in that evidence. Both observers now log on entry (0.2.5), which answers it
+  directly instead of by elimination:
+  `scene activated Car[2-3]:com.google.ios.youtubemusic (bridged=1, already
+  configured=0)` on the reconnect. Same identifier byte-for-byte either side of
+  the teardown — the reuse the diagnosis depended on, now observed rather than
+  assumed — with `bridged=1` proving the session *was* re-marked and activation
+  *does* fire again on reconnect.
+
+  Two further fixes from that review (0.2.5):
+  - `gActiveCarScenes` is gone. It incremented only for scenes that reached
+    `CSCarSceneConnected` but decremented for every bridged disconnect, so a
+    scene torn down before it ever activated stole a decrement and could leave
+    `CSHasActiveCarScene()` — which gates all of `CSKeyboard` — reporting NO
+    while a scene was live. It was a second representation of what
+    `gConfiguredScenes` already knows, so the counter was deleted rather than
+    repaired.
+  - Declined the suggestion to re-key the set to session object identity in a
+    weak table. The identical identifier across the teardown indicates the
+    session is reused, so object identity would very likely reproduce the same
+    stale-entry bug; pruning on the disconnect *event* does not depend on that
+    assumption. The reasoning is recorded at the declaration.
+
+- [x] **Per-app options are not dead for App Store apps — premise disproven
+  (2026-08-18).** The long-standing suspicion that per-app settings never reach
+  a sandboxed app was wrong, as were both earlier candidates (`CSApp.dylib` not
+  injected; `CSLogFilePath` mis-selecting a path). What was actually broken was
+  only the *reporting*: `CSVerboseEnabled` in `shared/CSLog.m` checked two
+  sandbox-denied paths and never `/var/jb/Library/CarSurf/relay.plist` — the one
+  candidate an app sandbox can read, and the one `CSConfig` was already reading
+  successfully in the same process. Every log macro is gated on it, so app-side
+  logging was a runtime no-op in exactly the apps the tweak exists for.
+  `CSConfigLocation` now owns the paths and the change notification for all five
+  call sites that had grown private copies, and `CSVerboseEnabled` re-reads on
+  `com.pavunato.carsurf/reload` (it was a bare `dispatch_once` with no observer,
+  so toggling verbose logging did nothing until the process restarted).
+
+  With logging alive, the geometry path measured clean end to end. YouTube Music
+  is configured `{enabled=1, scale=0.5}` with no `idiomMode`; `defaults` is
+  `{idiomMode=2, scale=0.7296417}`. A cold launch driven from the CarPlay side
+  produced `car scene connected (mode=1, scale=0.50, layout=1)` and `configured
+  car window to 1190x720 at (45,0), 0.50x, display 640x360, safe l=45` — the
+  per-app scale and the defaults idiom resolving correctly from two different
+  sources. Changing the value to 0.85 and firing the reload gave `700x424 at
+  0.85x` on the next cold launch (595/0.85, 360/0.85). No stale cache; the
+  `CSOptionsForThisApp` `dispatch_once` in `CSTraits` was not implicated.
+
+  Note the one real limitation this exposed: geometry is applied once per scene
+  connect, so editing scale or idiom does **not** re-flow a live car scene. The
+  app has to be relaunched. Worth deciding whether the reload notification
+  should re-apply geometry to an already-connected scene.
+
+- [x] **Manifest role spoof no longer installs in `carkitd` (0.2.3).**
+  `CSSystem.plist` filters in `carkitd`, and on iOS 18 `CSInstallCarPlayHooks`
+  took the `else` branch and swizzled `-[LSBundleProxy
+  objectForInfoDictionaryKey:ofClass:]` process-wide there.
+  [ios18-runtime-carplay-admission.md](ios18-runtime-carplay-admission.md)
+  lists hooking anything in `carkitd` as a hard rule — an earlier LS-accessor
+  hook there put the head unit into an endless connecting loop. No loop was
+  observed with this one, but the launch broker runs in SpringBoard and the
+  CarPlay hosts, so the daemon gained nothing from it. Now gated on
+  `CSIsCarKitDaemon()`; verified on device 2026-08-18, carkitd restarts clean
+  and logs `manifest role spoof withheld` while SpringBoard still installs it.
+  This is stricter than `CSCarKitPolicy`'s observe-only treatment of the same
+  daemon, deliberately: that hook is one low-frequency class method, this one
+  is a general info-dictionary accessor. Still wants a connected-car run.
 
 - [x] **On-disk patching removed from `helperd` (0.1.4-27-19).** Runtime
   admission covers every supported release, so the daemon no longer patches,

@@ -21,6 +21,7 @@
 #define CS_TAG "helperd"
 
 #import <Foundation/Foundation.h>
+#import "CSConfigLocation.h"
 #import "CSLog.h"
 #import <errno.h>
 #import <notify.h>
@@ -29,12 +30,8 @@
 #import <sys/stat.h>
 #import <unistd.h>
 
-static NSString *const kPrefsPath =
-    @"/var/mobile/Library/Preferences/com.pavunato.carsurf.plist";
 static NSString *const kStateDirectory = @"/var/jb/Library/CarSurf";
-/// Must match CSConfig's first relay candidate.
-static NSString *const kRelayPath = @"/var/jb/Library/CarSurf/relay.plist";
-static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
+
 
 #pragma mark - Relay
 
@@ -51,9 +48,9 @@ static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
 /// boot and re-runs on every preference change, so writing it here as well makes
 /// the relay independent of SpringBoard's injection state.
 static void CSWriteRelay(void) {
-    NSDictionary *preferences = [NSDictionary dictionaryWithContentsOfFile:kPrefsPath];
+    NSDictionary *preferences = [NSDictionary dictionaryWithContentsOfFile:CSPreferencesPath()];
     if (!preferences) {
-        CSLog("no preferences at %s; leaving relay untouched", kPrefsPath.UTF8String);
+        CSLog("no preferences at %s; leaving relay untouched", CSPreferencesPath().UTF8String);
         return;
     }
 
@@ -82,7 +79,7 @@ static void CSWriteRelay(void) {
     // remove-then-move: SpringBoard writes this same file (CSRelay.m) and both
     // sides raced, each losing write logging a failure and leaving the relay one
     // edit stale.
-    NSString *temporary = [NSString stringWithFormat:@"%@.%@.tmp", kRelayPath,
+    NSString *temporary = [NSString stringWithFormat:@"%@.%@.tmp", CSRelayMirrorPath(),
                            NSUUID.UUID.UUIDString];
     if (![data writeToFile:temporary atomically:NO]) {
         CSLog("relay write to %s failed", temporary.UTF8String);
@@ -91,13 +88,13 @@ static void CSWriteRelay(void) {
     chmod(temporary.fileSystemRepresentation, 0644);
 
     if (rename(temporary.fileSystemRepresentation,
-               kRelayPath.fileSystemRepresentation) != 0) {
+               CSRelayMirrorPath().fileSystemRepresentation) != 0) {
         CSLog("relay rename failed (errno %d: %s)", errno, strerror(errno));
         [fileManager removeItemAtPath:temporary error:NULL];
         return;
     }
 
-    CSLog("relay updated at %s (%lu bytes)", kRelayPath.UTF8String,
+    CSLog("relay updated at %s (%lu bytes)", CSRelayMirrorPath().UTF8String,
           (unsigned long)data.length);
 }
 
@@ -115,7 +112,7 @@ int main(int argc, char *argv[]) {
         CSWriteRelay();
 
         int reloadToken = 0;
-        notify_register_dispatch(kChangeNotification.UTF8String, &reloadToken,
+        notify_register_dispatch(CSConfigChangeNotification().UTF8String, &reloadToken,
                                  dispatch_get_main_queue(), ^(int t) {
             CSLog("preferences changed");
             CSWriteRelay();

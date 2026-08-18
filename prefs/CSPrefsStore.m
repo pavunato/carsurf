@@ -1,10 +1,8 @@
 #import "CSPrefsStore.h"
+#import "CSConfigLocation.h"
 #import <notify.h>
 #import <sys/stat.h>
 
-static NSString *const kPrefsPath =
-    @"/var/mobile/Library/Preferences/com.pavunato.carsurf.plist";
-static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
 static NSString *const kApplicationLibraryChangeNotification =
     @"com.pavunato.carsurf/application-library-change";
 static NSString *const kDashboardDisabledKey = @"dashboardDisabled";
@@ -22,7 +20,7 @@ static NSString *const kDashboardDisabledKey = @"dashboardDisabled";
 
 - (instancetype)init {
     if ((self = [super init])) {
-        NSDictionary *existing = [NSDictionary dictionaryWithContentsOfFile:kPrefsPath];
+        NSDictionary *existing = [NSDictionary dictionaryWithContentsOfFile:CSPreferencesPath()];
         _root = existing ? [existing mutableCopy] : [NSMutableDictionary new];
     }
     return self;
@@ -40,15 +38,15 @@ static NSString *const kDashboardDisabledKey = @"dashboardDisabled";
         NSLog(@"[CarSurf] preference serialization failed: %@", error);
         return;
     }
-    if (![data writeToFile:kPrefsPath options:NSDataWritingAtomic error:&error]) {
+    if (![data writeToFile:CSPreferencesPath() options:NSDataWritingAtomic error:&error]) {
         NSLog(@"[CarSurf] preference write failed: %@", error);
         return;
     }
     // SpringBoard's relay copy is what sandboxed apps read, so it needs to be
     // readable by them; the source plist stays owner-only.
-    chmod(kPrefsPath.fileSystemRepresentation, 0644);
+    chmod(CSPreferencesPath().fileSystemRepresentation, 0644);
 
-    notify_post(kChangeNotification.UTF8String);
+    notify_post(CSConfigChangeNotification().UTF8String);
 }
 
 /// Returns the mutable sub-dictionary at `key`, creating it if absent.

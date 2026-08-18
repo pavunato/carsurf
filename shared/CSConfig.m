@@ -1,6 +1,7 @@
 #define CS_TAG "config"
 
 #import "CSConfig.h"
+#import "CSConfigLocation.h"
 #import "CSLog.h"
 #import <dlfcn.h>
 #import <notify.h>
@@ -8,26 +9,8 @@
 #import <objc/runtime.h>
 #import <sys/stat.h>
 
-static NSString *const kPrefsPath =
-    @"/var/mobile/Library/Preferences/com.pavunato.carsurf.plist";
 static NSString *const kKillSwitchPath =
     @"/var/mobile/Library/Preferences/.carsurf-disable";
-/// SpringBoard mirrors the effective config to a relay file for processes whose
-/// sandbox refuses the Preferences directory.
-///
-/// Location matters more than permissions here: both the preference plist and the
-/// old /var/tmp relay were already mode 0644 and still unreadable from an app,
-/// because the app sandbox — not the filesystem — was refusing them. The jailbreak
-/// root is the one place known to be reachable, since every tweak dylib is itself
-/// loaded out of /var/jb/Library/MobileSubstrate inside these same sandboxes.
-/// /var/tmp is kept last for compatibility with older installs.
-static NSString *const kRelayPaths[] = {
-    @"/var/jb/Library/CarSurf/relay.plist",
-    @"/Library/CarSurf/relay.plist",
-    @"/var/tmp/.carsurf-relay.plist",
-};
-
-static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
 
 #pragma mark - Options
 
@@ -89,7 +72,7 @@ static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
     BOOL _safeMode;
 }
 
-+ (NSString *)changeNotificationName { return kChangeNotification; }
++ (NSString *)changeNotificationName { return CSConfigChangeNotification(); }
 
 + (CSConfig *)sharedConfig {
     static CSConfig *shared;
@@ -139,17 +122,13 @@ static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
 
 - (void)observeChanges {
     int token = 0;
-    notify_register_dispatch(kChangeNotification.UTF8String, &token,
+    notify_register_dispatch(CSConfigChangeNotification().UTF8String, &token,
                              dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                              ^(int t) { [self reload]; });
 }
 
 - (NSDictionary *)loadRoot {
-    NSMutableArray<NSString *> *candidates = [NSMutableArray arrayWithObject:kPrefsPath];
-    for (size_t i = 0; i < sizeof(kRelayPaths) / sizeof(*kRelayPaths); i++) {
-        [candidates addObject:kRelayPaths[i]];
-    }
-
+    NSArray<NSString *> *candidates = CSConfigCandidatePaths();
     for (NSString *path in candidates) {
         NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
         if (dict) {
@@ -269,17 +248,17 @@ static NSString *const kChangeNotification = @"com.pavunato.carsurf/reload";
                                                                format:NSPropertyListBinaryFormat_v1_0
                                                               options:0
                                                                 error:&error];
-    if (!data || ![data writeToFile:kPrefsPath options:NSDataWritingAtomic error:&error]) {
+    if (!data || ![data writeToFile:CSPreferencesPath() options:NSDataWritingAtomic error:&error]) {
         CSLog("preference prune write failed: %s", error.localizedDescription.UTF8String);
         return;
     }
-    chmod(kPrefsPath.fileSystemRepresentation, 0644);
+    chmod(CSPreferencesPath().fileSystemRepresentation, 0644);
 
     dispatch_barrier_sync(_queue, ^{
         _root = updatedRoot;
         [_optionsCache removeAllObjects];
     });
-    notify_post(kChangeNotification.UTF8String);
+    notify_post(CSConfigChangeNotification().UTF8String);
     if (removed.count > 0) {
         CSLog("pruned %lu uninstalled app preference entr%s: %s",
               (unsigned long)removed.count,

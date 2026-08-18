@@ -1,15 +1,11 @@
 #define CS_TAG "relay"
 
 #import "CSSystemInternal.h"
+#import "CSConfigLocation.h"
 #import "CSLog.h"
 #import <notify.h>
 #import <sys/stat.h>
 
-static NSString *const kPrefsPath =
-    @"/var/mobile/Library/Preferences/com.pavunato.carsurf.plist";
-/// Must match CSConfig's first relay candidate. Under the jailbreak root, which
-/// sandboxed apps can read; /var/tmp cannot be read from an app sandbox.
-static NSString *const kRelayPath = @"/var/jb/Library/CarSurf/relay.plist";
 
 // App sandboxes deny the shared Preferences directory. libSandy is the clean fix,
 // but it is only a Recommends, so SpringBoard also drops a world-readable copy of
@@ -22,6 +18,12 @@ static NSString *const kRelayPath = @"/var/jb/Library/CarSurf/relay.plist";
 // has not resprung yet would otherwise leave every app tweak inert. Both writers
 // are atomic and produce the same bytes, so whichever runs last is correct.
 static void CSWriteRelay(void) {
+    // Source and destination both come from CSConfigLocation, so this writer
+    // cannot drift from the readers: the mirror is by definition CSConfig's
+    // first relay candidate, the one an app sandbox can reach.
+    NSString *kPrefsPath = CSPreferencesPath();
+    NSString *kRelayPath = CSRelayMirrorPath();
+
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:kPrefsPath];
     if (!prefs) {
         CSVLog("no preferences at %s; leaving relay untouched", kPrefsPath.UTF8String);

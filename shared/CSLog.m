@@ -1,8 +1,11 @@
 #define CS_TAG "log"
 
 #import "CSLog.h"
+#import "CSConfigLocation.h"
+#import <notify.h>
 #import <os/log.h>
 #import <stdarg.h>
+#import <stdatomic.h>
 #import <sys/stat.h>
 #import <unistd.h>
 #import <mach/mach_time.h>
@@ -29,27 +32,44 @@ static os_log_t CSLogHandle(void) {
     return handle;
 }
 
+/// Reads the preference directly. CSConfig depends on this file, so it cannot be
+/// used here without a cycle — but the *locations* are shared (CSConfigLocation),
+/// because a private copy of that list is exactly how this went wrong: it lacked
+/// the jailbreak-root relay, the only candidate readable from an App Store app's
+/// sandbox, so every macro below compiled to a no-op in precisely the processes
+/// the tweak exists for.
+static BOOL CSReadVerbosePreference(void) {
+    for (NSString *path in CSConfigCandidatePaths()) {
+        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:path];
+        if (prefs) return [prefs[@"verboseLogging"] boolValue];
+    }
+    return NO;
+}
+
 BOOL CSVerboseEnabled(void) {
-    static BOOL enabled;
+    // The environment override is absolute and cannot be revoked by a config
+    // change; the preference below can, so it is re-read rather than frozen.
+    static BOOL forcedByEnvironment;
+    static atomic_bool enabled;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *env = getenv("CS_VERBOSE");
-        if (env && *env && *env != '0') {
-            enabled = YES;
-            return;
-        }
-        // Read the preference directly: CSConfig depends on this file, so it
-        // cannot be used here without a cycle.
-        for (NSString *path in @[ @"/var/mobile/Library/Preferences/com.pavunato.carsurf.plist",
-                                  @"/var/tmp/.carsurf-relay.plist" ]) {
-            NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:path];
-            if (prefs) {
-                enabled = [prefs[@"verboseLogging"] boolValue];
-                return;
-            }
-        }
+        forcedByEnvironment = env && *env && *env != '0';
+        atomic_store(&enabled, forcedByEnvironment || CSReadVerbosePreference());
+
+        // Without this the value was fixed for the life of the process: turning
+        // verbose logging on in Settings did nothing until every affected
+        // process was restarted. It also self-heals the boot race, where an app
+        // launching before SpringBoard has written the relay would otherwise
+        // stay silent forever — the next config change re-reads it.
+        int token = 0;
+        notify_register_dispatch(CSConfigChangeNotification().UTF8String, &token,
+                                 dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                                 ^(int t) {
+            atomic_store(&enabled, forcedByEnvironment || CSReadVerbosePreference());
+        });
     });
-    return enabled;
+    return atomic_load(&enabled);
 }
 
 /// The first writable log path for this process, resolved once.

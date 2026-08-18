@@ -27,6 +27,16 @@ static BOOL CSIsSpringBoard(void) {
     return [NSProcessInfo.processInfo.processName isEqualToString:@"SpringBoard"];
 }
 
+/// carkitd is the one process where a LaunchServices accessor hook is known to
+/// be fatal: an earlier entitlement spoof there put the head unit into an
+/// endless connecting loop (docs/ios18-runtime-carplay-admission.md states the
+/// rule without qualification). CSCarKitPolicy already treats the daemon as
+/// observe-only for the same reason; the manifest-role spoof is a broader,
+/// hotter accessor than that policy hook, so it is not installed there at all.
+static BOOL CSIsCarKitDaemon(void) {
+    return [NSProcessInfo.processInfo.processName isEqualToString:@"carkitd"];
+}
+
 static void CSInstallCarPlayHooks(void) {
     static BOOL installed = NO;
     if (installed) return;
@@ -54,7 +64,15 @@ static void CSInstallCarPlayHooks(void) {
         // still reads UIApplicationSceneManifest to obtain a CarPlay window
         // role. Install only that role accessor; the older entitlement and
         // cached-value hooks stay disabled because they sit on hot LS paths.
-        CSInstallSceneManifestRoleSpoof();
+        //
+        // The broker runs in SpringBoard and the CarPlay UI processes, which
+        // all still get it — carkitd never needed it and must not have it.
+        if (CSIsCarKitDaemon()) {
+            CSLog("carkitd — manifest role spoof withheld; the launch broker "
+                  "runs in SpringBoard and the CarPlay hosts");
+        } else {
+            CSInstallSceneManifestRoleSpoof();
+        }
     }
 
     // iOS 18-era path; the two below are no-ops when their classes are
@@ -110,6 +128,10 @@ static void CSSystemInit(void) {
         if (CSIsSpringBoard()) {
             CSStartRelay();
         }
+
+        // Self-gated to the CarPlay host. Must go in before DashBoard builds
+        // its workspace, so it cannot wait for the CarPlay hooks below.
+        CSInstallCarLaunch();
 
         // Capture the abort reason for the CarPlay-host launch crash. The host
         // exits with SIGABRT and respawns before ReportCrash can persist an .ips,

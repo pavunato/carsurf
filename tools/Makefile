@@ -56,4 +56,6 @@ internal-stage::
 ifneq ($(FINALPACKAGE),1)
 	$(ECHO_NOTHING)cp carsurf-vehicle.sh "$(THEOS_STAGING_DIR)/usr/local/bin/carsurf-vehicle"$(ECHO_END)
 	$(ECHO_NOTHING)chmod 755 "$(THEOS_STAGING_DIR)/usr/local/bin/carsurf-vehicle"$(ECHO_END)
+	$(ECHO_NOTHING)cp carsurf-launch.sh "$(THEOS_STAGING_DIR)/usr/local/bin/carsurf-launch"$(ECHO_END)
+	$(ECHO_NOTHING)chmod 755 "$(THEOS_STAGING_DIR)/usr/local/bin/carsurf-launch"$(ECHO_END)
 endif

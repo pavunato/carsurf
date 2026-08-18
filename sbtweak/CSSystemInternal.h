@@ -30,6 +30,12 @@ void CSInstallAppListFilter(void);
 /// so sandboxed app processes without libSandy can still read them.
 void CSStartRelay(void);
 
+/// Listens for com.pavunato.carsurf/carlaunch in the CarPlay host and drives
+/// DashBoard's own workspace activation for the bundle identifier named in
+/// /var/jb/Library/CarSurf/carlaunch. Lets carsurf-launch open an app on the
+/// car screen over SSH; no-op outside the CarPlay process.
+void CSInstallCarLaunch(void);
+
 /// Installs a synchronous uncaught-exception + fatal-signal handler that records
 /// the abort reason (name/reason/backtrace) to carsurf.log before the process
 /// dies. Debug diagnostic for the CarPlay-host SIGABRT on app launch; no-op on a

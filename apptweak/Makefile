@@ -11,6 +11,7 @@ CSApp_FILES += CSKeyboard.m
 CSApp_FILES += ../shared/CSConfig.m
 CSApp_FILES += ../shared/CSRuntime.m
 CSApp_FILES += ../shared/CSLog.m
+CSApp_FILES += ../shared/CSConfigLocation.m
 
 CSApp_CFLAGS = -fobjc-arc -I../shared -Wno-deprecated-declarations
 CSApp_FRAMEWORKS = Foundation UIKit QuartzCore Security

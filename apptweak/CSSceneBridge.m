@@ -79,9 +79,42 @@ BOOL CSIsBridgedCarScene(UIScene *scene) {
     return scene && CSIsSessionBridged(scene.session);
 }
 
-static NSInteger gActiveCarScenes = 0;
+/// Car scenes that have connected and had their geometry applied, keyed on the
+/// session's -persistentIdentifier. The lifecycle observer listens for
+/// activation rather than connection (the delegate has no window yet at connect
+/// time), and activation fires on every foreground, so membership is what keeps
+/// the geometry from being recomputed each time the user returns to the app.
+///
+/// It must be pruned on disconnect. The identifier is *persistent*: a CarPlay
+/// host restart tears the scene down and rebuilds it under the same one, so a
+/// stale entry silently skips CSCarSceneConnected — no geometry, no mirroring.
+/// Device-verified on iphone-11: before the prune, killing the CarPlay host left
+/// the surviving app logging the role rewrite for the new scene but never "car
+/// scene connected", stuck at the previous scale until the process was killed.
+/// Pruning on the disconnect *event* is deliberate rather than keying this on
+/// session object identity in a weak table like CSBridgedSessions above: we have
+/// not established that a reconnect produces a new session object, and if it
+/// reuses the old one — which the stable identifier suggests — object identity
+/// would reproduce exactly the bug this prune fixes.
+///
+/// This set is also the single source of truth for CSHasActiveCarScene. A
+/// separate counter used to track the same thing and drifted: it incremented
+/// only for scenes that reached CSCarSceneConnected, but decremented for every
+/// bridged disconnect, so a scene torn down before it ever activated stole a
+/// decrement and could report "no car scene" while one was live.
+///
+/// Main-thread only, so no lock. UIScene lifecycle notifications are posted on
+/// the main thread and both observers register with queue:nil, i.e. delivered
+/// synchronously on the posting thread. CSBridgedSessions above does take a lock
+/// because it is reached from the -[UISceneSession role] swizzle, which app code
+/// can call from any thread.
+static NSMutableSet<NSString *> *gConfiguredScenes;
 
-BOOL CSHasActiveCarScene(void) { return gActiveCarScenes > 0; }
+BOOL CSHasActiveCarScene(void) { return gConfiguredScenes.count > 0; }
+
+static NSString *CSSceneIdentifier(UIScene *scene) {
+    return scene.session.persistentIdentifier ?: @"";
+}
 
 #pragma mark - Role rewriting
 
@@ -322,8 +355,6 @@ void CSApplyScaleToCarScene(UIWindowScene *scene, CSAppOptions *options) {
 #pragma mark - Scene lifecycle
 
 static void CSCarSceneConnected(UIScene *scene) {
-    gActiveCarScenes++;
-
     NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"";
     CSAppOptions *options = [CSConfig.sharedConfig optionsForBundle:bundleID];
 
@@ -352,7 +383,9 @@ static void CSCarSceneConnected(UIScene *scene) {
 }
 
 static void CSCarSceneDisconnected(UIScene *scene) {
-    if (gActiveCarScenes > 0) gActiveCarScenes--;
+    // Drops this session out of CSHasActiveCarScene and lets a reconnect of the
+    // same session be treated as a fresh scene that gets its geometry applied.
+    [gConfiguredScenes removeObject:CSSceneIdentifier(scene)];
     CSLog("car scene disconnected");
     CSStopMirroring();
 }
@@ -365,19 +398,28 @@ static void CSObserveSceneLifecycle(void) {
     [center addObserverForName:UISceneDidActivateNotification object:nil queue:nil
                     usingBlock:^(NSNotification *note) {
         UIScene *scene = note.object;
-        if (!CSIsBridgedCarScene(scene)) return;
-        static NSMutableSet *seen;
-        if (!seen) seen = [NSMutableSet new];
-        NSString *identifier = scene.session.persistentIdentifier ?: @"";
-        if ([seen containsObject:identifier]) return;
-        [seen addObject:identifier];
+        NSString *identifier = CSSceneIdentifier(scene);
+        BOOL bridged = CSIsBridgedCarScene(scene);
+        // Every early return below is otherwise indistinguishable from the
+        // notification never arriving: all three look like silence. That
+        // ambiguity is what made the reconnect bug above expensive to find.
+        CSVLog("scene activated %s (bridged=%d, already configured=%d)",
+               identifier.UTF8String, bridged,
+               [gConfiguredScenes containsObject:identifier]);
+        if (!bridged) return;
+        if (!gConfiguredScenes) gConfiguredScenes = [NSMutableSet new];
+        if ([gConfiguredScenes containsObject:identifier]) return;
+        [gConfiguredScenes addObject:identifier];
         CSCarSceneConnected(scene);
     }];
 
     [center addObserverForName:UISceneDidDisconnectNotification object:nil queue:nil
                     usingBlock:^(NSNotification *note) {
         UIScene *scene = note.object;
-        if (!CSIsBridgedCarScene(scene)) return;
+        BOOL bridged = CSIsBridgedCarScene(scene);
+        CSVLog("scene disconnected %s (bridged=%d)",
+               CSSceneIdentifier(scene).UTF8String, bridged);
+        if (!bridged) return;
         CSCarSceneDisconnected(scene);
     }];
 }

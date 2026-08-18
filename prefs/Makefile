@@ -9,6 +9,7 @@ CSPrefs_FILES += CSLayoutSegmentCell.m
 CSPrefs_FILES += CSScaleSliderCell.m
 CSPrefs_FILES += CSPrefsStore.m
 CSPrefs_FILES += ../shared/CSLog.m
+CSPrefs_FILES += ../shared/CSConfigLocation.m
 CSPrefs_FILES += ../shared/CSAppFilter.m
 
 CSPrefs_CFLAGS = -fobjc-arc -I../shared -DCARSURF_HIDE_SYSTEM_APPS=$(CARSURF_HIDE_SYSTEM_APPS)
