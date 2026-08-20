@@ -29,3 +29,5 @@ Main-VideoStream-*.png
 # Machine output from device-audit.sh — megabytes per run, findings already
 # captured in docs/TODO.md.
 docs/audits/
+diagnostics/
+reference/
