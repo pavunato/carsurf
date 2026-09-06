@@ -3,6 +3,8 @@
 #import "CSAppInternal.h"
 #import "CSLog.h"
 #import "CSPrivate.h"
+#import "CSRuntime.h"
+#import <objc/message.h>
 
 // Apps with no UIApplicationSceneManifest run in UIKit's single-window
 // compatibility mode: their delegate owns exactly one UIWindow and there is no
@@ -27,8 +29,199 @@ static UIWindow *gCarWindow;
 static __weak UIWindowScene *gCarScene;
 static CSAppOptions *gCarOptions;
 static CGSize gSourceSize;
-static BOOL gVideoActive;
-static BOOL gAutoHorizontalApplied;
+static __weak id gWindowOwningDelegate;
+static BOOL gDelegateWindowReassigned;
+static BOOL gCompatibilityHooksInstalled;
+static NSUInteger gGeometryReconcileGeneration;
+static NSUInteger gSourceRootAliasCount;
+static UIViewController *(*gOriginalWindowRootViewController)(UIWindow *, SEL);
+static void (*gOriginalViewDidAppear)(UIViewController *, SEL, BOOL);
+static void (*gOriginalViewDidDisappear)(UIViewController *, SEL, BOOL);
+static void (*gOriginalPresent)(UIViewController *, SEL, UIViewController *, BOOL,
+                                void (^)(void));
+static void (*gOriginalDismiss)(UIViewController *, SEL, BOOL, void (^)(void));
+
+static UIEdgeInsets CSConfigureTransplantWindow(UIWindow *window,
+                                                  UIWindowScene *scene,
+                                                  CSAppOptions *options,
+                                                  CGSize sourceSize,
+                                                  BOOL autoHorizontal,
+                                                  BOOL *outPortrait);
+
+/// Keep legacy application-window discovery coherent after transplantation.
+/// UIKit still owns exactly one real root: the car window. Only reads through
+/// the now-empty source window are aliased, and only while that exact root is
+/// actively transplanted. This repairs callers that start from delegate.window
+/// without changing UIApplication.keyWindow or redirecting presentations.
+static UIViewController *cs_windowRootViewController(UIWindow *self, SEL _cmd) {
+    UIViewController *root = gOriginalWindowRootViewController(self, _cmd);
+    if (!root && self == gSourceWindow && gCarWindow && gTransplantedRoot) {
+        gSourceRootAliasCount++;
+        if (gSourceRootAliasCount <= 8) {
+            CSLog("aliased empty source-window root to transplanted root "
+                  "(read=%lu root=%s)",
+                  (unsigned long)gSourceRootAliasCount,
+                  object_getClassName(gTransplantedRoot));
+        }
+        return gTransplantedRoot;
+    }
+    return root;
+}
+
+static void CSLogLabeledViews(UIView *view, NSUInteger depth,
+                              NSUInteger *visited, NSUInteger *logged) {
+    if (!view || depth > 40 || *visited >= 1500 || *logged >= 300) return;
+    (*visited)++;
+
+    NSString *label = view.accessibilityLabel;
+    if (label.length > 0) {
+        CGRect frame = [view convertRect:view.bounds toView:gCarWindow];
+        CSLog("labeled-view view=%p class=%s depth=%lu hidden=%d alpha=%.2f "
+              "windowFrame=(%.0f,%.0f %.0fx%.0f) label=%s",
+              (__bridge void *)view, object_getClassName(view),
+              (unsigned long)depth, view.hidden,
+              view.alpha, frame.origin.x, frame.origin.y,
+              frame.size.width, frame.size.height, label.UTF8String);
+        (*logged)++;
+    }
+
+    for (UIView *child in view.subviews) {
+        CSLogLabeledViews(child, depth + 1, visited, logged);
+        if (*visited >= 1500 || *logged >= 300) break;
+    }
+}
+
+static void CSLogPresentationSnapshot(const char *phase) {
+    if (!gCarWindow || !gTransplantedRoot) return;
+    NSUInteger visited = 0;
+    NSUInteger logged = 0;
+    CSLog("presentation snapshot begin phase=%s root=%s presented=%s",
+          phase, object_getClassName(gTransplantedRoot),
+          gTransplantedRoot.presentedViewController
+              ? object_getClassName(gTransplantedRoot.presentedViewController) : "nil");
+    CSLogLabeledViews(gTransplantedRoot.viewIfLoaded, 0, &visited, &logged);
+    CSLog("presentation snapshot end phase=%s visited=%lu labeled=%lu",
+          phase, (unsigned long)visited, (unsigned long)logged);
+}
+
+static void cs_present(UIViewController *self, SEL _cmd,
+                       UIViewController *controller, BOOL animated,
+                       void (^completion)(void)) {
+    BOOL onCar = self.viewIfLoaded.window == gCarWindow;
+    if (onCar) {
+        CSLog("presentation request presenter=%s target=%s style=%ld",
+              object_getClassName(self), object_getClassName(controller),
+              (long)controller.modalPresentationStyle);
+        CSLogPresentationSnapshot("before-present");
+    }
+    void (^wrapped)(void) = ^{
+        if (onCar) CSLogPresentationSnapshot("after-present");
+        if (completion) completion();
+    };
+    gOriginalPresent(self, _cmd, controller, animated, wrapped);
+}
+
+static void cs_dismiss(UIViewController *self, SEL _cmd, BOOL animated,
+                       void (^completion)(void)) {
+    BOOL onCar = self.viewIfLoaded.window == gCarWindow;
+    void (^wrapped)(void) = ^{
+        if (onCar) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(0.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                CSLogPresentationSnapshot("after-dismiss");
+            });
+        }
+        if (completion) completion();
+    };
+    gOriginalDismiss(self, _cmd, animated, wrapped);
+}
+
+static void CSLogTransplantedStateAfterTransition(void) {
+    if (!gCarWindow || !gCarScene || !gCarOptions || !gTransplantedRoot) return;
+
+    CGSize mainSize = UIScreen.mainScreen.bounds.size;
+    CGSize carSize = gCarScene.screen.bounds.size;
+    CSLog("transplanted state after controller transition "
+          "(root=%s window=%.0fx%.0f interfaceOrientation=%ld "
+          "mainScreen=%.0fx%.0f carScreen=%.0fx%.0f)",
+          object_getClassName(gTransplantedRoot),
+          gCarWindow.bounds.size.width, gCarWindow.bounds.size.height,
+          (long)gCarScene.interfaceOrientation,
+          mainSize.width, mainSize.height, carSize.width, carSize.height);
+}
+
+static void CSScheduleTransplantedLayoutReconciliation(UIViewController *controller) {
+    if (!gCarWindow || controller.viewIfLoaded.window != gCarWindow) return;
+
+    NSUInteger generation = ++gGeometryReconcileGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != gGeometryReconcileGeneration) return;
+        CSLogTransplantedStateAfterTransition();
+    });
+}
+
+static void cs_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
+    gOriginalViewDidAppear(self, _cmd, animated);
+    if (self.viewIfLoaded.window == gCarWindow) {
+        CSLog("controller transition did-appear class=%s parent=%s presenting=%s "
+              "presented=%s frame=%.0fx%.0f",
+              object_getClassName(self),
+              self.parentViewController
+                  ? object_getClassName(self.parentViewController) : "nil",
+              self.presentingViewController
+                  ? object_getClassName(self.presentingViewController) : "nil",
+              self.presentedViewController
+                  ? object_getClassName(self.presentedViewController) : "nil",
+              self.viewIfLoaded.bounds.size.width,
+              self.viewIfLoaded.bounds.size.height);
+    }
+    CSScheduleTransplantedLayoutReconciliation(self);
+}
+
+static void cs_viewDidDisappear(UIViewController *self, SEL _cmd, BOOL animated) {
+    gOriginalViewDidDisappear(self, _cmd, animated);
+    if (self.viewIfLoaded.window == gCarWindow) {
+        CSLog("controller transition did-disappear class=%s parent=%s "
+              "presenting=%s presented=%s frame=%.0fx%.0f",
+              object_getClassName(self),
+              self.parentViewController
+                  ? object_getClassName(self.parentViewController) : "nil",
+              self.presentingViewController
+                  ? object_getClassName(self.presentingViewController) : "nil",
+              self.presentedViewController
+                  ? object_getClassName(self.presentedViewController) : "nil",
+              self.viewIfLoaded.bounds.size.width,
+              self.viewIfLoaded.bounds.size.height);
+    }
+    CSScheduleTransplantedLayoutReconciliation(self);
+}
+
+static void CSInstallTransplantCompatibilityHooks(void) {
+    if (gCompatibilityHooksInstalled) return;
+    gCompatibilityHooksInstalled = YES;
+
+    BOOL root = CSSwizzleInstanceMethod(UIWindow.class,
+        @selector(rootViewController), (IMP)cs_windowRootViewController,
+        (IMP *)&gOriginalWindowRootViewController);
+    BOOL appeared = CSSwizzleInstanceMethod(UIViewController.class,
+        @selector(viewDidAppear:), (IMP)cs_viewDidAppear,
+        (IMP *)&gOriginalViewDidAppear);
+    BOOL disappeared = CSSwizzleInstanceMethod(UIViewController.class,
+        @selector(viewDidDisappear:), (IMP)cs_viewDidDisappear,
+        (IMP *)&gOriginalViewDidDisappear);
+    BOOL present = CSSwizzleInstanceMethod(UIViewController.class,
+        @selector(presentViewController:animated:completion:), (IMP)cs_present,
+        (IMP *)&gOriginalPresent);
+    BOOL dismiss = CSSwizzleInstanceMethod(UIViewController.class,
+        @selector(dismissViewControllerAnimated:completion:), (IMP)cs_dismiss,
+        (IMP *)&gOriginalDismiss);
+    CSLog("generic transplant compatibility installed "
+          "(sourceRoot=%d appear=%d disappear=%d present=%d dismiss=%d)",
+          root, appeared, disappeared, present, dismiss);
+}
 
 /// Positions the actual app window inside whatever CarPlay's persistent chrome
 /// leaves free — a leading sidebar on a landscape head unit, a bottom bar on a
@@ -68,8 +261,8 @@ BOOL CSAppIsSingleWindowOnly(void) {
         NSDictionary *configurations = [manifest isKindOfClass:NSDictionary.class]
                                            ? manifest[@"UISceneConfigurations"] : nil;
 
-        // Template roles do not count. A native CarPlay app — YouTube Music,
-        // Zalo — declares a manifest whose only configurations are
+        // Template roles do not count. Some native CarPlay apps declare a
+        // manifest whose only configurations are
         // CPTemplateApplication* ones, so counting them called it multi-scene
         // and left it in independent-scene mode. Nothing then builds the car
         // UI: the app has no plain window-scene delegate to answer the role
@@ -183,28 +376,8 @@ void CSStartMirroringIntoScene(UIWindowScene *scene, CSAppOptions *options) {
         CSLog("already transplanted; ignoring duplicate request");
         return;
     }
+    CSInstallTransplantCompatibilityHooks();
     CSAttemptTransplant(scene, options, 10);
-}
-
-void CSSetMirroringVideoActive(BOOL active) {
-    // Remember the player state even if it arrives before the mirror window is
-    // ready. The initial transplant then starts in the correct Auto geometry.
-    gVideoActive = active;
-    if (!gCarWindow || !gCarScene || !gCarOptions) return;
-
-    BOOL autoHorizontal = active && gCarOptions.layoutMode == CSLayoutModeAuto;
-    if (gAutoHorizontalApplied == autoHorizontal) return;
-
-    gAutoHorizontalApplied = autoHorizontal;
-    BOOL portrait = NO;
-    CSConfigureTransplantWindow(gCarWindow, gCarScene, gCarOptions,
-                                  gSourceSize, autoHorizontal, &portrait);
-    [gCarWindow.rootViewController.view setNeedsLayout];
-    [gCarWindow.rootViewController.view layoutIfNeeded];
-    CSLog("video auto-layout active=%d result=%s window=%.0fx%.0f at x=%.0f",
-            active, portrait ? "vertical" : "horizontal",
-            gCarWindow.bounds.size.width, gCarWindow.bounds.size.height,
-            gCarWindow.layer.position.x);
 }
 
 static void CSAttemptTransplant(UIWindowScene *scene, CSAppOptions *options,
@@ -251,7 +424,6 @@ static void CSAttemptTransplant(UIWindowScene *scene, CSAppOptions *options,
     gCarScene = scene;
     gCarOptions = options;
     gSourceSize = source.bounds.size;
-    gAutoHorizontalApplied = gVideoActive && options.layoutMode == CSLayoutModeAuto;
 
     // Detach before re-attaching: UIKit asserts if a view controller is set as the
     // root of two windows at once.
@@ -263,10 +435,31 @@ static void CSAttemptTransplant(UIWindowScene *scene, CSAppOptions *options,
     [car makeKeyAndVisible];
     gCarWindow = car;
 
+    // Compatibility-mode apps commonly treat applicationDelegate.window as
+    // their canonical UI context. Once its root moves, leaving that property
+    // aimed at the empty placeholder window gives newly built controllers the
+    // wrong scene, screen, and traits. Move the ownership reference with the
+    // hierarchy and restore it on disconnect.
+    id appDelegate = UIApplication.sharedApplication.delegate;
+    SEL windowSelector = @selector(window);
+    SEL setWindowSelector = @selector(setWindow:);
+    if ([appDelegate respondsToSelector:windowSelector] &&
+        [appDelegate respondsToSelector:setWindowSelector]) {
+        UIWindow *delegateWindow =
+            ((UIWindow *(*)(id, SEL))objc_msgSend)(appDelegate, windowSelector);
+        if (delegateWindow == source) {
+            ((void (*)(id, SEL, UIWindow *))objc_msgSend)(appDelegate,
+                                                         setWindowSelector, car);
+            gWindowOwningDelegate = appDelegate;
+            gDelegateWindowReassigned = YES;
+            CSLog("application delegate window reassigned to transplant");
+        }
+    }
+
     BOOL portrait = NO;
     UIEdgeInsets sceneSafeArea =
         CSConfigureTransplantWindow(car, scene, options, gSourceSize,
-                                      gAutoHorizontalApplied,
+                                      NO,
                                       &portrait);
     UIEdgeInsets contentSafeArea = root.view.safeAreaInsets;
 
@@ -296,6 +489,11 @@ void CSStopMirroring(void) {
     // UI on next activation.
     if (source) {
         source.rootViewController = root;
+        if (gDelegateWindowReassigned && gWindowOwningDelegate &&
+            [gWindowOwningDelegate respondsToSelector:@selector(setWindow:)]) {
+            ((void (*)(id, SEL, UIWindow *))objc_msgSend)(
+                gWindowOwningDelegate, @selector(setWindow:), source);
+        }
         [source makeKeyAndVisible];
         CSLog("restored %s to the phone display", object_getClassName(root));
     } else {
@@ -307,5 +505,8 @@ void CSStopMirroring(void) {
     gCarScene = nil;
     gCarOptions = nil;
     gSourceSize = CGSizeZero;
-    gAutoHorizontalApplied = NO;
+    gWindowOwningDelegate = nil;
+    gDelegateWindowReassigned = NO;
+    gGeometryReconcileGeneration++;
+    gSourceRootAliasCount = 0;
 }

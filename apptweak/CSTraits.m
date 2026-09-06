@@ -83,5 +83,5 @@ void CSInstallTraitOverrides(void) {
     }
 
     CSLog("trait overrides installed (traitIdiom=%d deviceIdiom=%d mode=%ld)",
-            traitIdiom, deviceIdiom, (long)options.idiomMode);
+          traitIdiom, deviceIdiom, (long)options.idiomMode);
 }

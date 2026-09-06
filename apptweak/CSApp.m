@@ -177,7 +177,6 @@ static void CSAppInit(void) {
 
         CSInstallSceneBridge();
         CSInstallTraitOverrides();
-        CSInstallFullscreenLayoutSupport();
         CSInstallKeyboardSupport();
         CSTimingLog("app init end bridge-installed bundle=%s", bundleID.UTF8String);
     }

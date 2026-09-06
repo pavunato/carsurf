@@ -71,15 +71,6 @@ BOOL CSAppIsSingleWindowOnly(void);
 void CSStartMirroringIntoScene(UIWindowScene *scene, CSAppOptions *options);
 void CSStopMirroring(void);
 
-/// Temporarily expands an Auto-layout mirror to the full horizontal CarPlay
-/// viewport while an app-owned video player is active. Explicit Horizontal and
-/// Vertical selections are never overridden.
-void CSSetMirroringVideoActive(BOOL active);
-
-/// Installs narrow, app-specific video lifecycle adapters. These only change
-/// Auto-layout geometry; they do not intercept modal or overlay presentation.
-void CSInstallFullscreenLayoutSupport(void);
-
 /// Enables UIKit's software keyboard for text responders hosted on a bridged
 /// external-display scene. The overrides are inactive without a live car scene.
 void CSInstallKeyboardSupport(void);
