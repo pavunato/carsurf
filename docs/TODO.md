@@ -4,6 +4,12 @@
 
 ## Open
 
+- [ ] **No auto-horizontal-on-video geometry (regressed 0.2.6).** Removing
+  `CSFullscreen.m` dropped the YouTube-only behavior that widened Auto-mode
+  mirroring to full horizontal while a video player was active, with nothing
+  general replacing it. Revisit if Auto-mode video layout is wanted back —
+  ideally via a signal that doesn't require naming the app's view controller
+  classes (e.g. `AVPlayerViewController` presentation/fullscreen state).
 - [ ] **Customize list omits CarSurf apps.** The CRS fetch wrapper is off (it
   crashed native CarPlay — see below), so Settings > Customize shows only the
   12 Apple icons; apps still show on the dashboard. Needs a list update that
@@ -19,6 +25,38 @@
   still needs a connected-car run.
 
 ## Done — keep the reasoning
+
+- [x] **Generic transplant compatibility replaces the YouTube-only fullscreen
+  hack (0.2.6).** `CSFullscreen.m` swizzled `YTWatchViewController` /
+  `YTWatchFullscreenViewController` lifecycle methods by name to flip the
+  mirror window between Auto's horizontal and vertical geometry while a video
+  player was on screen — useless for every other single-window-compat app,
+  and one more thing that breaks silently when YouTube renames a class.
+  Deleted, along with `CSSetMirroringVideoActive` and the
+  `gAutoHorizontalApplied` state it drove.
+
+  In its place, `CSMirror.m` installs app-agnostic compatibility shims once a
+  transplant starts:
+  - `-[UIWindow rootViewController]` is swizzled so reads through the now-empty
+    *source* window alias to the transplanted root — compatibility-mode apps
+    that cache `delegate.window` and re-read its `rootViewController` (instead
+    of holding the controller directly) keep seeing their real UI instead of
+    `nil`. Only applies while that exact root is actively transplanted; never
+    touches `UIApplication.keyWindow` or redirects presentation.
+  - `applicationDelegate.window` itself is reassigned from the source window to
+    the car window for the duration of the transplant (restored on
+    `CSStopMirroring`), so newly built controllers that read `.window.windowScene`
+    or `.window.traitCollection` pick up the car scene instead of the detached
+    phone one.
+  - `viewDidAppear:` / `viewDidDisappear:` / `presentViewController:` /
+    `dismissViewController:` are swizzled for diagnostic logging only (view
+    hierarchy snapshots, controller-transition frames) — no behavior change —
+    so a future compat bug report on some other app has the same evidence the
+    YouTube investigation used to build this, without needing a per-app hook.
+
+  Net effect: the auto-horizontal-on-video-playback behavior is gone (no
+  general replacement shipped yet — nothing else fills that gap), but mirror
+  compatibility for single-window apps is no longer YouTube-specific.
 
 - [x] **Geometry never re-applied after a CarPlay reconnect (0.2.4).** This was
   the real defect behind "first scene ignores the display setting", and the
