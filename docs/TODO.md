@@ -26,6 +26,37 @@
 
 ## Done — keep the reasoning
 
+- [x] **A fullscreen modal left part of the page behind (0.2.7).** In YouTube on
+  the head unit, entering the fullscreen player and coming back left the watch
+  page without its metadata strip — title, view count, channel, like — until the
+  video was reopened. Device log, before/after the presentation of
+  `YTWatchFullscreenViewController`: the strip's controller is still a child of
+  the watch controller (`loaded=1`), but `inWindow=0 superview=-`; its view was
+  removed by the app itself, from an animation completion block on the way *in*,
+  and never put back on the way out. Everything else — player, engagement panel,
+  the side column — returned at its exact pre-fullscreen geometry.
+
+  What the app is missing is the geometry change it would get on a phone. A
+  phone leaves fullscreen by rotating back, and the relayout that follows is
+  what re-attaches the branch. The car window is a fixed landscape canvas: it
+  never rotates and never resizes, the scene keeps reporting
+  `interfaceOrientation=1`, and a restore waiting on that transition waits
+  forever. Confirmed not to be a screen-measurement problem — an override that
+  reported the transplant canvas as `UIScreen.mainScreen.bounds` was live in the
+  failing run and changed nothing, so it was dropped rather than shipped on a
+  hunch.
+
+  Fix, in `CSMirror.m` and app-agnostic: a modal presentation over the
+  transplanted root must not permanently change what the presenting hierarchy is
+  attached to. Before the outermost presentation, the attachment of every loaded
+  child controller's view (superview, subview index, frame) is recorded; 0.35s
+  after the dismissal settles — the app's own restore first — anything still
+  detached is put back. Only a controller that is *still a child* of a
+  controller back on the car window qualifies: a branch the app genuinely tore
+  down has no parent to be restored under and is left for the app to rebuild.
+  The heavy view-tree/controller-tree snapshot logging that found this is gone
+  with it; the ledger logs one line per restored branch instead.
+
 - [x] **Generic transplant compatibility replaces the YouTube-only fullscreen
   hack (0.2.6).** `CSFullscreen.m` swizzled `YTWatchViewController` /
   `YTWatchFullscreenViewController` lifecycle methods by name to flip the

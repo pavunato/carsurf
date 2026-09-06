@@ -68,68 +68,134 @@ static UIViewController *cs_windowRootViewController(UIWindow *self, SEL _cmd) {
     return root;
 }
 
-static void CSLogLabeledViews(UIView *view, NSUInteger depth,
-                              NSUInteger *visited, NSUInteger *logged) {
-    if (!view || depth > 40 || *visited >= 1500 || *logged >= 300) return;
-    (*visited)++;
+/// What the presenting hierarchy was attached to before a modal presentation.
+///
+/// A full-screen presentation is allowed to detach the views underneath it — the
+/// app itself does this to free the player, and UIKit does it for the snapshotted
+/// branches it replaces. What the app then owes is symmetry: everything it took
+/// apart on the way in goes back together on the way out. On the phone that
+/// second half is driven by the geometry change the dismissal brings with it. A
+/// transplanted app never gets one: the car window is a fixed landscape canvas
+/// that neither rotates nor resizes, so a restore that waits for a size or
+/// orientation transition waits forever and a branch stays detached.
+///
+/// So the ledger records the attachment of every loaded child controller's view
+/// before the presentation and puts back whatever is still missing once the
+/// dismissal has settled. Only controllers that are *still children* of a
+/// controller back on the car window are restored: a branch the app tore down for
+/// real has no parent left to be restored under, and rebuilding it is the app's
+/// job, not ours.
+@interface CSViewAttachment : NSObject
+@property (nonatomic, weak) UIViewController *controller;
+@property (nonatomic, weak) UIView *view;
+@property (nonatomic, weak) UIView *superview;
+@property (nonatomic) NSUInteger index;
+@property (nonatomic) CGRect frame;
+@end
 
-    NSString *label = view.accessibilityLabel;
-    if (label.length > 0) {
-        CGRect frame = [view convertRect:view.bounds toView:gCarWindow];
-        CSLog("labeled-view view=%p class=%s depth=%lu hidden=%d alpha=%.2f "
-              "windowFrame=(%.0f,%.0f %.0fx%.0f) label=%s",
-              (__bridge void *)view, object_getClassName(view),
-              (unsigned long)depth, view.hidden,
-              view.alpha, frame.origin.x, frame.origin.y,
-              frame.size.width, frame.size.height, label.UTF8String);
-        (*logged)++;
+@implementation CSViewAttachment
+@end
+
+static NSMutableArray<CSViewAttachment *> *gPresentationAttachments;
+
+static void CSRecordAttachments(UIViewController *controller,
+                                NSMutableArray<CSViewAttachment *> *into) {
+    if (into.count >= 512) return;
+
+    UIView *view = controller.viewIfLoaded;
+    UIView *superview = view.superview;
+    if (superview && view.window == gCarWindow) {
+        CSViewAttachment *attachment = [CSViewAttachment new];
+        attachment.controller = controller;
+        attachment.view = view;
+        attachment.superview = superview;
+        attachment.index = [superview.subviews indexOfObject:view];
+        attachment.frame = view.frame;
+        [into addObject:attachment];
     }
 
-    for (UIView *child in view.subviews) {
-        CSLogLabeledViews(child, depth + 1, visited, logged);
-        if (*visited >= 1500 || *logged >= 300) break;
+    // Children only. The presented branch has its own lifetime and is not part
+    // of what the presentation displaces.
+    for (UIViewController *child in controller.childViewControllers) {
+        CSRecordAttachments(child, into);
     }
 }
 
-static void CSLogPresentationSnapshot(const char *phase) {
-    if (!gCarWindow || !gTransplantedRoot) return;
-    NSUInteger visited = 0;
-    NSUInteger logged = 0;
-    CSLog("presentation snapshot begin phase=%s root=%s presented=%s",
-          phase, object_getClassName(gTransplantedRoot),
-          gTransplantedRoot.presentedViewController
-              ? object_getClassName(gTransplantedRoot.presentedViewController) : "nil");
-    CSLogLabeledViews(gTransplantedRoot.viewIfLoaded, 0, &visited, &logged);
-    CSLog("presentation snapshot end phase=%s visited=%lu labeled=%lu",
-          phase, (unsigned long)visited, (unsigned long)logged);
+/// The modal still standing over the car window, if any. A dismissal that only
+/// uncovers another modal has not put the app back yet.
+static UIViewController *CSCarWindowPresentedController(void) {
+    return gCarWindow.rootViewController.presentedViewController;
+}
+
+static void CSRestoreDisplacedAttachments(void) {
+    NSArray<CSViewAttachment *> *ledger = gPresentationAttachments;
+    gPresentationAttachments = nil;
+    if (!gCarWindow || ledger.count == 0) return;
+
+    NSUInteger restored = 0;
+    for (CSViewAttachment *attachment in ledger) {
+        UIViewController *controller = attachment.controller;
+        UIView *view = attachment.view;
+        UIView *superview = attachment.superview;
+        if (!controller || !view || view.superview) continue;
+
+        // Merely detached, not torn down: still a child of a controller whose
+        // own view is back on the car window, and its old container is too.
+        UIViewController *parent = controller.parentViewController;
+        if (!parent || parent.viewIfLoaded.window != gCarWindow) continue;
+        if (!superview || superview.window != gCarWindow) continue;
+
+        [superview insertSubview:view
+                         atIndex:MIN(attachment.index, superview.subviews.count)];
+        // The app slid this view out of the way before dropping it; put it back
+        // where it was. A container that lays its subviews out itself will
+        // overwrite this on the next pass, which is the correct outcome either way.
+        view.frame = attachment.frame;
+        restored++;
+        CSLog("restored %s under %s (index=%lu frame=%.0fx%.0f), displaced by a "
+              "presentation and never re-attached",
+              object_getClassName(controller), object_getClassName(superview),
+              (unsigned long)attachment.index,
+              attachment.frame.size.width, attachment.frame.size.height);
+    }
+
+    if (restored > 0) {
+        [gCarWindow.rootViewController.view setNeedsLayout];
+        CSLog("presentation restore complete (restored=%lu of %lu recorded)",
+              (unsigned long)restored, (unsigned long)ledger.count);
+    }
 }
 
 static void cs_present(UIViewController *self, SEL _cmd,
                        UIViewController *controller, BOOL animated,
                        void (^completion)(void)) {
-    BOOL onCar = self.viewIfLoaded.window == gCarWindow;
-    if (onCar) {
-        CSLog("presentation request presenter=%s target=%s style=%ld",
-              object_getClassName(self), object_getClassName(controller),
-              (long)controller.modalPresentationStyle);
-        CSLogPresentationSnapshot("before-present");
+    // Only the outermost presentation is recorded, and a stale ledger left by a
+    // dismissal that never reached this hook is replaced rather than trusted:
+    // nothing is covering the window, so nothing it describes is displaced.
+    if (gCarWindow && gTransplantedRoot && !CSCarWindowPresentedController() &&
+        self.viewIfLoaded.window == gCarWindow) {
+        NSMutableArray<CSViewAttachment *> *ledger = [NSMutableArray array];
+        CSRecordAttachments(gTransplantedRoot, ledger);
+        gPresentationAttachments = ledger;
+        CSVLog("presentation by %s over %s: %lu attached controller view(s) recorded",
+               object_getClassName(self), object_getClassName(controller),
+               (unsigned long)ledger.count);
     }
-    void (^wrapped)(void) = ^{
-        if (onCar) CSLogPresentationSnapshot("after-present");
-        if (completion) completion();
-    };
-    gOriginalPresent(self, _cmd, controller, animated, wrapped);
+    gOriginalPresent(self, _cmd, controller, animated, completion);
 }
 
 static void cs_dismiss(UIViewController *self, SEL _cmd, BOOL animated,
                        void (^completion)(void)) {
-    BOOL onCar = self.viewIfLoaded.window == gCarWindow;
+    BOOL onCar = gCarWindow && self.viewIfLoaded.window == gCarWindow;
     void (^wrapped)(void) = ^{
-        if (onCar) {
+        if (onCar && gPresentationAttachments) {
+            // After the dismissal has settled, so the app's own restore runs
+            // first and this only fills in what it left behind.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(0.2 * NSEC_PER_SEC)),
+                                         (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                CSLogPresentationSnapshot("after-dismiss");
+                if (CSCarWindowPresentedController()) return;
+                CSRestoreDisplacedAttachments();
             });
         }
         if (completion) completion();
@@ -509,4 +575,5 @@ void CSStopMirroring(void) {
     gDelegateWindowReassigned = NO;
     gGeometryReconcileGeneration++;
     gSourceRootAliasCount = 0;
+    gPresentationAttachments = nil;
 }
