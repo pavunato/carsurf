@@ -32,6 +32,7 @@ void CSSetLeavesTemplateScenesAlone(BOOL leaveAlone);
 
 /// YES once a bridged car scene has connected in this process.
 BOOL CSHasActiveCarScene(void);
+BOOL CSIsBridgingForCar(void);
 
 /// YES if this scene is one the tweak bridged onto the head-unit display.
 BOOL CSIsBridgedCarScene(UIScene *_Nullable scene);

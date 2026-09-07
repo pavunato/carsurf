@@ -1,6 +1,7 @@
 #define CS_TAG "scene"
 
 #import "CSAppInternal.h"
+#import <stdatomic.h>
 #import "CSLog.h"
 #import "CSPrivate.h"
 #import "CSRuntime.h"
@@ -42,6 +43,20 @@ BOOL CSIsCarSceneRole(NSString *role) {
 
 #pragma mark - Bridged scene bookkeeping
 
+/// Whether this process is building for the head unit at all, as opposed to
+/// merely having the tweak loaded. True from the moment a car scene's role is
+/// rewritten — before the app's delegate has built a window — and false again
+/// once the last car scene disconnects.
+///
+/// CSHasActiveCarScene below answers a different question and is the wrong gate
+/// for anything that has to be right during launch: it only becomes true at
+/// scene *activation*, by which point an app has already chosen its layout. A
+/// plain atomic rather than a count over the weak table, because the idiom
+/// override reads this on every trait query.
+static atomic_bool gBridgingForCar;
+
+BOOL CSIsBridgingForCar(void) { return atomic_load(&gBridgingForCar); }
+
 /// Sessions whose role we rewrote. Weak, so a disconnected scene's session does
 /// not keep anything alive.
 static NSHashTable *CSBridgedSessions(void) {
@@ -64,6 +79,7 @@ static void CSMarkSessionBridged(id session) {
     [lock lock];
     [CSBridgedSessions() addObject:session];
     [lock unlock];
+    atomic_store(&gBridgingForCar, true);
 }
 
 static BOOL CSIsSessionBridged(id session) {
@@ -288,6 +304,25 @@ CGRect CSCarViewportForWindow(UIWindow *window, UIWindowScene *scene,
         usableFrame.size.width = portraitWidth;
     }
 
+    // Every input to the decision, because a viewport that comes out wrong is
+    // otherwise indistinguishable from an app that lays out wrong. A head unit
+    // has been seen reporting a 240pt-tall screen where it reports 360 in every
+    // other session, which sizes the window to two thirds of the display and
+    // makes a fullscreen video overflow it.
+    UIScreen *screen = scene.screen;
+    CGRect nativeBounds = screen.nativeBounds;
+    CGSize modeSize = screen.currentMode.size;
+    CSLog("viewport %.0fx%.0f at (%.0f,%.0f) from scene %.0fx%.0f "
+          "(screen %.0fx%.0f, native %.0fx%.0f @%.1fx, mode %.0fx%.0f, "
+          "safe l=%.0f t=%.0f r=%.0f b=%.0f, portrait=%d)",
+          usableFrame.size.width, usableFrame.size.height,
+          usableFrame.origin.x, usableFrame.origin.y,
+          sceneBounds.size.width, sceneBounds.size.height,
+          screen.bounds.size.width, screen.bounds.size.height,
+          nativeBounds.size.width, nativeBounds.size.height, screen.scale,
+          modeSize.width, modeSize.height,
+          safeArea.left, safeArea.top, safeArea.right, safeArea.bottom, portrait);
+
     if (outSafeArea) *outSafeArea = safeArea;
     if (outPortrait) *outPortrait = portrait;
     return usableFrame;
@@ -403,6 +438,7 @@ static void CSCarSceneDisconnected(UIScene *scene) {
     // Drops this session out of CSHasActiveCarScene and lets a reconnect of the
     // same session be treated as a fresh scene that gets its geometry applied.
     [gConfiguredScenes removeObject:CSSceneIdentifier(scene)];
+    if (gConfiguredScenes.count == 0) atomic_store(&gBridgingForCar, false);
     gCarScreen = nil;
     CSLog("car scene disconnected");
     CSStopMirroring();

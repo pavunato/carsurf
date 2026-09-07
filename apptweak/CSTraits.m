@@ -31,7 +31,17 @@ static CSAppOptions *CSOptionsForThisApp(void) {
 static UIUserInterfaceIdiom (*orig_userInterfaceIdiom)(id, SEL);
 static UIUserInterfaceIdiom (*orig_deviceUserInterfaceIdiom)(id, SEL);
 
+/// Both getters are process-global, so an override installed for the head unit
+/// also answers every query the app's own phone-side UI makes. Settings is where
+/// that bit: with no car scene of its own it still reported Pad, so
+/// -[PSListController showConfirmationViewForSpecifier:] took the iPad branch,
+/// threw building the "Forget This Car" alert, and aborted Preferences on every
+/// tap — the car could not be forgotten at all. Bound to an actual car session
+/// instead, which is also true from scene configuration onwards and so still
+/// covers a CarPlay-launched app deciding its layout.
 static UIUserInterfaceIdiom CSForcedIdiom(UIUserInterfaceIdiom original) {
+    if (!CSIsBridgingForCar()) return original;
+
     switch (CSOptionsForThisApp().idiomMode) {
         case CSIdiomModePhone: return UIUserInterfaceIdiomPhone;
         case CSIdiomModePad:   return UIUserInterfaceIdiomPad;
@@ -40,14 +50,24 @@ static UIUserInterfaceIdiom CSForcedIdiom(UIUserInterfaceIdiom original) {
     return original;
 }
 
+/// Once for each outcome rather than once overall, because the gate flips when a
+/// car scene appears and a single line cannot show both sides of it.
 static void CSLogIdiomOverrideOnce(const char *source,
                                      UIUserInterfaceIdiom original,
                                      UIUserInterfaceIdiom forced) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        CSLog("idiom query via %s: original=%ld forced=%ld", source,
-                (long)original, (long)forced);
-    });
+    static dispatch_once_t appliedOnce;
+    static dispatch_once_t leftAloneOnce;
+    if (forced != original) {
+        dispatch_once(&appliedOnce, ^{
+            CSLog("idiom query via %s: original=%ld forced=%ld", source,
+                    (long)original, (long)forced);
+        });
+    } else {
+        dispatch_once(&leftAloneOnce, ^{
+            CSLog("idiom query via %s: original=%ld left alone (bridgingForCar=%d)",
+                    source, (long)original, CSIsBridgingForCar());
+        });
+    }
 }
 
 static UIUserInterfaceIdiom cs_userInterfaceIdiom(id self, SEL _cmd) {
