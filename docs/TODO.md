@@ -26,6 +26,48 @@
 
 ## Done — keep the reasoning
 
+- [x] **Settings could not forget a car (0.2.9).** Tapping "Forget This Car"
+  aborted Preferences: an uncaught exception from
+  `+[UIAlertAction actionWithTitle:style:handler:]` under
+  `-[PSListController showConfirmationViewForSpecifier:useAlert:]`. The idiom
+  override swizzles `-[UITraitCollection userInterfaceIdiom]` and
+  `-[UIDevice userInterfaceIdiom]`, both process-global. Preferences is
+  allowlisted and sets no `idiomMode`, so it inherited `defaults.idiomMode = Pad`
+  and the *phone* Settings UI was told it was an iPad — the log shows the
+  override applied alongside `scene activated … (bridged=0)`, i.e. no car scene
+  anywhere. PSListController took the iPad branch of its confirmation UI and
+  threw.
+
+  Gated on `CSIsBridgingForCar()`, set when a car scene's role is rewritten and
+  cleared when the last one disconnects. `CSHasActiveCarScene()` is the wrong
+  gate here and worth remembering why: it only becomes true at scene
+  *activation*, long after a CarPlay-launched app has chosen its layout, so it
+  would have broken every bridged app to fix Settings.
+
+- [x] **Fullscreen exit left the page half-built (0.2.9).** Two separate faults
+  behind one report. First, the car window never changes size, so leaving
+  fullscreen delivers none of the size transition a phone gets for free from the
+  accompanying rotation, and an app keeps the geometry it cached while
+  fullscreen — YouTube's player came back at video aspect (width x 9/16, 670pt
+  inside a 480pt window) and ran off the bottom. Opening the same video from
+  scratch laid out correctly, so the app was never confused by the canvas; it was
+  simply never told to look at it again. `CSDeliverSizeTransition` nudges the
+  window bounds 1pt and back, which costs no screen space — a 16:9 viewport clamp
+  was tried first and rejected, since it pillarboxed ~28% of the display.
+
+  Second, the presentation leaves parts of the page underneath detached, and the
+  0.2.7 ledger put them back only once the dismissal had finished — which is the
+  *end* of the exit animation, so the page slid in with a hole where the title
+  and view count belong. The restore now also runs as the dismissal starts,
+  before the reveal is animated. Every pass is guarded on the view actually being
+  detached, so all three (dismissal started, did-appear, dismissal settled) are
+  safe to repeat and only the last spends the ledger.
+
+  Both triggers are events, not timers. An earlier version waited a guessed 0.35s
+  and read as the layout visibly correcting itself a beat after the video was
+  already back; that delay survives only as a fallback for a dismissal that
+  reveals no controller at all.
+
 - [x] **Display links never ticked on the head unit (0.2.8).** Reported as
   "YouTube Music's lyrics don't scroll while the song plays", but nothing about
   it is app-specific. A sampler on the car scene ran a 1s run-loop timer, an
