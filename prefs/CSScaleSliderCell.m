@@ -1,4 +1,5 @@
 #import "CSScaleSliderCell.h"
+#import "CSConfig.h"
 #import <CoreText/SFNTLayoutTypes.h>
 
 /// The same font, with digits that do not change width as the value changes.
@@ -60,7 +61,7 @@ static UIFont *CSMonospacedDigits(UIFont *font) {
 
     _carsurfSlider = [[UISlider alloc] initWithFrame:CGRectZero];
     _carsurfSlider.translatesAutoresizingMaskIntoConstraints = NO;
-    _carsurfSlider.minimumValue = [[specifier propertyForKey:@"min"] floatValue] ?: 0.5;
+    _carsurfSlider.minimumValue = [[specifier propertyForKey:@"min"] floatValue] ?: kCSMinScale;
     _carsurfSlider.maximumValue = [[specifier propertyForKey:@"max"] floatValue] ?: 2.0;
     _carsurfSlider.continuous = YES;
     _carsurfSlider.accessibilityLabel = specifier.name ?: @"Scale";

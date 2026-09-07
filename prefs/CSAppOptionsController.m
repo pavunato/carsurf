@@ -121,8 +121,8 @@
                                               cell:PSSliderCell
                                               edit:Nil];
         [scale setProperty:@"scale" forKey:@"carsurfKey"];
-        [scale setProperty:@(0.5) forKey:@"min"];
-        [scale setProperty:@(2.0) forKey:@"max"];
+        [scale setProperty:@(kCSMinScale) forKey:@"min"];
+        [scale setProperty:@(kCSMaxScale) forKey:@"max"];
         [scale setProperty:@(1.0) forKey:@"default"];
         [scale setProperty:CSScaleSliderCell.class forKey:@"cellClass"];
         [scale setProperty:@(84.0) forKey:@"height"];

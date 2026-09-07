@@ -28,7 +28,7 @@ static NSString *const kKillSwitchPath =
 
         CGFloat scale = dict[@"scale"] ? [dict[@"scale"] doubleValue] : 1.0;
         if (!isfinite(scale)) scale = 1.0;
-        _scale = MIN(MAX(scale, 0.5), 2.0);
+        _scale = MIN(MAX(scale, kCSMinScale), kCSMaxScale);
 
         // iPhone spoofing helps far more apps than it hurts, so it remains the
         // default. Read the former boolean when upgrading an existing plist.

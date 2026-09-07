@@ -32,12 +32,20 @@ typedef NS_ENUM(NSInteger, CSIdiomMode) {
     CSIdiomModePad = 2,
 };
 
+/// Bounds of the render scale, shared by the settings sliders and the clamp the
+/// tweak applies when reading a stored value, so a slider can never offer a
+/// scale the tweak will silently refuse. The floor is deliberately far below
+/// anything useful on a large head unit: a small display needs a lot of
+/// shrinking before an app's UI fits it at all.
+static const CGFloat kCSMinScale = 0.1;
+static const CGFloat kCSMaxScale = 2.0;
+
 /// Per-app options. Values are clamped on read, so a hand-edited plist cannot
 /// produce a scale of 0 or a negative rotation.
 @interface CSAppOptions : NSObject
 @property (nonatomic, readonly, copy) NSString *bundleIdentifier;
 @property (nonatomic, readonly) CSBridgeMode mode;
-/// Render scale applied to the car scene, 0.5–2.0. 1.0 = native.
+/// Render scale applied to the car scene, kCSMinScale–kCSMaxScale. 1.0 = native.
 @property (nonatomic, readonly) CGFloat scale;
 /// Auto, iPhone, or iPad interface family reported to the app.
 @property (nonatomic, readonly) CSIdiomMode idiomMode;
