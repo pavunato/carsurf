@@ -36,6 +36,17 @@ BOOL CSHasActiveCarScene(void);
 /// YES if this scene is one the tweak bridged onto the head-unit display.
 BOOL CSIsBridgedCarScene(UIScene *_Nullable scene);
 
+/// The head unit's screen while a bridged car scene is connected, else nil.
+UIScreen *_Nullable CSCarScreen(void);
+
+/// Hands the app display links driven by the head unit's screen instead of the
+/// phone's. The phone display is asleep for the whole drive, so an ordinary
+/// CADisplayLink never ticks and everything the app animates from one is frozen
+/// on the car. Call once a car scene has connected: it touches UIScreen, which
+/// cannot be reached from a dylib constructor without deadlocking UIKit's
+/// launch.
+void CSInstallDisplayLinkBridge(void);
+
 #pragma mark - Gate G3: make the app lay out for the head unit
 
 /// Reports UIUserInterfaceIdiomPhone in place of ...IdiomCarPlay.

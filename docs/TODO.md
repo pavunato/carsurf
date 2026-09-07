@@ -26,6 +26,47 @@
 
 ## Done — keep the reasoning
 
+- [x] **Display links never ticked on the head unit (0.2.8).** Reported as
+  "YouTube Music's lyrics don't scroll while the song plays", but nothing about
+  it is app-specific. A sampler on the car scene ran a 1s run-loop timer, an
+  ordinary `CADisplayLink`, and a link built from the car scene's own screen side
+  by side. With the app foreground-active on the car (`app=0 scene=0`), it
+  measured `displayLink main=0 car=60 tick(s)/s`: the timer kept firing and the
+  ordinary display link had stopped dead, while the car-screen link ran at full
+  rate.
+
+  `+[CADisplayLink displayLinkWithTarget:selector:]` binds to the main display.
+  During a drive that display is asleep, so the link is never serviced — and
+  every animation a bridged app drives per frame goes with it: synced lyrics,
+  scrubbers, any custom animation. UIView/Core Animation work is unaffected
+  (the render server drives it), which is why the damage looked narrow and
+  app-specific instead of systemic.
+
+  Fix, in `CSDisplayLink.m`: `+[CADisplayLink displayLinkWithTarget:selector:]`
+  and `-[UIScreen displayLinkWithTarget:selector:]` return a link built against
+  the head unit's screen, forwarding to the app's original target/selector.
+  `addToRunLoop:`/`removeFromRunLoop:`/`invalidate` are mirrored onto a standby
+  link on the app's original screen, which forwards only if the primary has gone
+  quiet for ~6 frames — so unplugging the car does not leave the app bound to a
+  dead screen. Measured after: `main=60 car=60`. A car-screen link was also
+  checked while the app was pushed to the background by another app taking the
+  display (`app=2 scene=2`): it kept ticking at 57-60, so the redirect does not
+  strand an app that leaves the car.
+
+  Installed from `CSCarSceneConnected` under `dispatch_once`, *not* from the
+  dylib constructor. Touching `UIScreen` that early runs `+[UIScreen initialize]`
+  — even via `class_getInstanceMethod`, which was the second crash — and that
+  blocks in `-[_UIApplicationConfigurationLoader _loadInitializationContext]` on
+  a `dispatch_once` UIKit has not reached yet; the app then dies on the 20s
+  launch watchdog (`0x8BADF00D`). Device-verified twice.
+
+  Not confirmed on glass: raising YouTube Music's player and opening its Lyrics
+  tab needs a touch. `uiopen` cannot help — it targets the phone display, which
+  is asleep, and does not even switch apps while a drive is up; app launches go
+  through `carsurf-launch`. A deep link handed straight to the app's scene
+  delegate in-process did navigate, but left the watch page parked below the
+  fold.
+
 - [x] **A fullscreen modal left part of the page behind (0.2.7).** In YouTube on
   the head unit, entering the fullscreen player and coming back left the watch
   page without its metadata strip — title, view count, channel, like — until the

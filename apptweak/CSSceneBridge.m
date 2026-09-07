@@ -112,6 +112,14 @@ static NSMutableSet<NSString *> *gConfiguredScenes;
 
 BOOL CSHasActiveCarScene(void) { return gConfiguredScenes.count > 0; }
 
+/// The head unit's screen, for anything that has to be built against the display
+/// the app is actually on rather than the sleeping phone (CSDisplayLink.m). Held
+/// weakly and read from any thread: a weak load is atomic, and it goes nil on its
+/// own if the scene is torn down without a disconnect notification.
+static __weak UIScreen *gCarScreen;
+
+UIScreen *CSCarScreen(void) { return gCarScreen; }
+
 static NSString *CSSceneIdentifier(UIScene *scene) {
     return scene.session.persistentIdentifier ?: @"";
 }
@@ -373,6 +381,15 @@ static void CSCarSceneConnected(UIScene *scene) {
     }
 
     UIWindowScene *windowScene = (UIWindowScene *)scene;
+    gCarScreen = windowScene.screen;
+
+    // Installed here, not from the dylib constructor: reaching UIScreen that
+    // early — even through class_getInstanceMethod — runs +[UIScreen initialize],
+    // which blocks in -[_UIApplicationConfigurationLoader _loadInitializationContext]
+    // on a dispatch_once UIKit has not reached yet, and the app dies on the
+    // 20-second launch watchdog. Device-verified, twice.
+    static dispatch_once_t displayLinkOnce;
+    dispatch_once(&displayLinkOnce, ^{ CSInstallDisplayLinkBridge(); });
     if (mode == CSBridgeModeMirror) {
         CSStartMirroringIntoScene(windowScene, options);
     } else {
@@ -386,6 +403,7 @@ static void CSCarSceneDisconnected(UIScene *scene) {
     // Drops this session out of CSHasActiveCarScene and lets a reconnect of the
     // same session be treated as a fresh scene that gets its geometry applied.
     [gConfiguredScenes removeObject:CSSceneIdentifier(scene)];
+    gCarScreen = nil;
     CSLog("car scene disconnected");
     CSStopMirroring();
 }
