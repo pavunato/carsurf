@@ -127,9 +127,15 @@ static UIViewController *CSCarWindowPresentedController(void) {
     return gCarWindow.rootViewController.presentedViewController;
 }
 
-static void CSRestoreDisplacedAttachments(void) {
+/// Run repeatedly across a dismissal: once as it starts, again as it reveals
+/// something, and a last time once it has settled. Every attachment is guarded on
+/// the view actually being detached right now, so an early pass fills in what is
+/// already missing — the title and view count under a watch page, in practice —
+/// and a later pass catches anything the app took longer to drop. Only the final
+/// pass spends the ledger.
+static void CSRestoreDisplacedAttachments(const char *trigger, BOOL final) {
     NSArray<CSViewAttachment *> *ledger = gPresentationAttachments;
-    gPresentationAttachments = nil;
+    if (final) gPresentationAttachments = nil;
     if (!gCarWindow || ledger.count == 0) return;
 
     NSUInteger restored = 0;
@@ -161,8 +167,58 @@ static void CSRestoreDisplacedAttachments(void) {
 
     if (restored > 0) {
         [gCarWindow.rootViewController.view setNeedsLayout];
-        CSLog("presentation restore complete (restored=%lu of %lu recorded)",
-              (unsigned long)restored, (unsigned long)ledger.count);
+        CSLog("presentation restore complete (restored=%lu of %lu recorded, "
+              "trigger=%s)", (unsigned long)restored,
+              (unsigned long)ledger.count, trigger);
+    }
+}
+
+/// A phone leaves fullscreen by rotating back, and the window size change that
+/// comes with it is what makes every controller recompute its layout. The car
+/// window never changes size, so that transition never fires and an app keeps
+/// whatever geometry it cached while it was fullscreen: YouTube's player returns
+/// at video aspect — width x 9/16, 670pt inside a 480pt window — filling the
+/// width with the picture running off the bottom. Opening the same video from
+/// scratch lays it out correctly at 265pt, so the app is not confused by the
+/// canvas; it is simply never told to look at it again.
+///
+/// Move the window off its size and back to deliver that transition. Nothing
+/// about this is specific to one app: any app that recomputes layout on a size
+/// change is waiting for the same signal, and one that does not is unaffected.
+/// Armed the moment a dismissal starts on the car window, spent as soon as the
+/// controller it reveals has appeared. Waiting on a timer instead costs the whole
+/// guessed delay on top of the app's exit animation, which reads as the layout
+/// visibly correcting itself a beat after the video is already back.
+static BOOL gPendingSizeTransition = NO;
+
+static void CSDeliverSizeTransition(void) {
+    if (!gCarWindow) return;
+
+    CGRect bounds = gCarWindow.bounds;
+    if (bounds.size.height < 2.0) return;
+
+    CGRect nudged = bounds;
+    nudged.size.height -= 1.0;
+    gCarWindow.bounds = nudged;
+    [gCarWindow layoutIfNeeded];
+    gCarWindow.bounds = bounds;
+    [gCarWindow layoutIfNeeded];
+
+    CSLog("delivered a size transition at %.0fx%.0f after a fullscreen dismissal",
+          bounds.size.width, bounds.size.height);
+}
+
+/// Everything a fullscreen dismissal leaves to put right, in one place: views the
+/// presentation displaced, then the size transition that makes the app lay the
+/// result out again. Both triggers call this; whichever arrives once the
+/// dismissal is genuinely over does the work.
+static void CSDeliverPendingRepair(const char *trigger, BOOL final) {
+    if (!gCarWindow || CSCarWindowPresentedController()) return;
+
+    if (gPresentationAttachments) CSRestoreDisplacedAttachments(trigger, final);
+    if (gPendingSizeTransition) {
+        gPendingSizeTransition = NO;
+        CSDeliverSizeTransition();
     }
 }
 
@@ -187,20 +243,31 @@ static void cs_present(UIViewController *self, SEL _cmd,
 static void cs_dismiss(UIViewController *self, SEL _cmd, BOOL animated,
                        void (^completion)(void)) {
     BOOL onCar = gCarWindow && self.viewIfLoaded.window == gCarWindow;
+    if (onCar) gPendingSizeTransition = YES;
     void (^wrapped)(void) = ^{
-        if (onCar && gPresentationAttachments) {
+        if (onCar) {
             // After the dismissal has settled, so the app's own restore runs
-            // first and this only fills in what it left behind.
+            // first and this only corrects what it left behind.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                if (CSCarWindowPresentedController()) return;
-                CSRestoreDisplacedAttachments();
+                // Fallback: a dismissal that reveals nothing gets no
+                // did-appear, and an app that restores late is caught here.
+                CSDeliverPendingRepair("dismissal settled", YES);
             });
         }
         if (completion) completion();
     };
     gOriginalDismiss(self, _cmd, animated, wrapped);
+
+    // The views the presentation displaced are already detached and the modal
+    // covering them is on its way out, so put them back now rather than at the
+    // end of the exit animation. Waiting until the reveal has finished is what
+    // reads as lag: the watch page slides in with a hole where its title and
+    // view count belong and only fills once the animation is over. Not routed
+    // through CSDeliverPendingRepair because the modal is still presented at
+    // this point, which is exactly the case that guard exists to reject.
+    if (onCar) CSRestoreDisplacedAttachments("dismissal started", NO);
 }
 
 static void CSLogTransplantedStateAfterTransition(void) {
@@ -208,12 +275,20 @@ static void CSLogTransplantedStateAfterTransition(void) {
 
     CGSize mainSize = UIScreen.mainScreen.bounds.size;
     CGSize carSize = gCarScene.screen.bounds.size;
+    // Traits and orientation alongside the geometry, because an app picks its
+    // layout from these and not from the bounds. A landscape window that
+    // reports itself portrait gets the app's portrait layout: content stacked
+    // top-to-bottom in a canvas that has no height to stack in.
+    UITraitCollection *traits = gCarWindow.traitCollection;
     CSLog("transplanted state after controller transition "
           "(root=%s window=%.0fx%.0f interfaceOrientation=%ld "
+          "idiom=%ld hSize=%ld vSize=%ld "
           "mainScreen=%.0fx%.0f carScreen=%.0fx%.0f)",
           object_getClassName(gTransplantedRoot),
           gCarWindow.bounds.size.width, gCarWindow.bounds.size.height,
           (long)gCarScene.interfaceOrientation,
+          (long)traits.userInterfaceIdiom,
+          (long)traits.horizontalSizeClass, (long)traits.verticalSizeClass,
           mainSize.width, mainSize.height, carSize.width, carSize.height);
 }
 
@@ -243,6 +318,13 @@ static void cs_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
                   ? object_getClassName(self.presentedViewController) : "nil",
               self.viewIfLoaded.bounds.size.width,
               self.viewIfLoaded.bounds.size.height);
+        // The app has finished putting back whatever the fullscreen presentation
+        // covered, so this is the earliest point the size transition can land
+        // without being overwritten by that restore. Next turn, so this appear
+        // pass completes first.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CSDeliverPendingRepair("did-appear", NO);
+        });
     }
     CSScheduleTransplantedLayoutReconciliation(self);
 }
