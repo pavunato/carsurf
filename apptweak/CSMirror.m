@@ -347,9 +347,51 @@ static void cs_viewDidDisappear(UIViewController *self, SEL _cmd, BOOL animated)
     CSScheduleTransplantedLayoutReconciliation(self);
 }
 
+#if DEBUG
+// Observe the real UIKit delivery without adding competing recognizers or
+// changing their decisions. Log only starts/ends, so a drag cannot flood logs.
+static void (*gOriginalSendEvent)(UIApplication *, SEL, UIEvent *);
+static void cs_carSendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
+    BOOL trace = gCarWindow && event.type == UIEventTypeTouches;
+    if (trace) {
+        for (UITouch *touch in event.allTouches) {
+            if (touch.window != gCarWindow) continue;
+            if (touch.phase != UITouchPhaseBegan && touch.phase != UITouchPhaseEnded &&
+                touch.phase != UITouchPhaseCancelled) continue;
+            CGPoint point = [touch locationInView:gCarWindow];
+            CSLog("touch phase=%ld type=%ld at=%.1f,%.1f hit=%s recognizers=%lu",
+                  (long)touch.phase, (long)touch.type, point.x, point.y,
+                  touch.view ? object_getClassName(touch.view) : "nil",
+                  (unsigned long)touch.gestureRecognizers.count);
+            if (touch.phase == UITouchPhaseBegan) {
+                NSUInteger depth = 0;
+                for (UIView *view = touch.view; view && depth++ < 12; view = view.superview) {
+                    CGRect frame = [view convertRect:view.bounds toView:gCarWindow];
+                    CSLog("touch ancestor=%s frame=%.0f,%.0f %.0fx%.0f",
+                          object_getClassName(view), frame.origin.x, frame.origin.y,
+                          frame.size.width, frame.size.height);
+                }
+            }
+            for (UIGestureRecognizer *gesture in touch.gestureRecognizers) {
+                CSLog("touch recognizer=%s state=%ld enabled=%d delegate=%s",
+                      object_getClassName(gesture), (long)gesture.state, gesture.enabled,
+                      gesture.delegate ? object_getClassName(gesture.delegate) : "nil");
+            }
+        }
+    }
+    gOriginalSendEvent(self, _cmd, event);
+}
+#endif
+
 static void CSInstallTransplantCompatibilityHooks(void) {
     if (gCompatibilityHooksInstalled) return;
     gCompatibilityHooksInstalled = YES;
+
+#if DEBUG
+    BOOL touchTrace = CSSwizzleInstanceMethod(UIApplication.class,
+        @selector(sendEvent:), (IMP)cs_carSendEvent, (IMP *)&gOriginalSendEvent);
+    CSLog("debug car-window touch trace installed=%d", touchTrace);
+#endif
 
     BOOL root = CSSwizzleInstanceMethod(UIWindow.class,
         @selector(rootViewController), (IMP)cs_windowRootViewController,

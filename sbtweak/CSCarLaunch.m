@@ -51,29 +51,28 @@ static BOOL CSIsCarPlayHost(void) {
 
 #pragma mark - Capturing the workspace
 
-// DBWorkspace has no shared accessor — DashBoard constructs one and hands it
-// around — so the only way to reach the instance is to be present when it is
-// made. Both initialisers are covered because -init is not obviously a wrapper
-// for -initWithOwner: on this release, and guessing wrong costs the feature.
+// A connected instrument cluster creates another DBWorkspace. Only the
+// dashboard owner can present applications on the main CarPlay display.
+// Capturing every -init makes the last-created (cluster) workspace win.
 
-static id (*orig_workspaceInit)(id, SEL);
 static id (*orig_workspaceInitWithOwner)(id, SEL, id);
 
-static void CSNoteWorkspace(id workspace) {
+static void CSNoteWorkspace(id workspace, id owner) {
     if (!workspace) return;
+    Class dashboardOwner = CSLookupClass("DBDashboardWorkspaceOwner");
+    if (!dashboardOwner || ![owner isKindOfClass:dashboardOwner]) {
+        CSLog("ignored DBWorkspace %p owner=%s", workspace,
+              owner ? object_getClassName(owner) : "nil");
+        return;
+    }
     gWorkspace = workspace;
-    CSLog("captured DBWorkspace %p", workspace);
-}
-
-static id cs_workspaceInit(id self, SEL _cmd) {
-    id result = orig_workspaceInit(self, _cmd);
-    CSNoteWorkspace(result);
-    return result;
+    CSLog("captured dashboard DBWorkspace %p owner=%s", workspace,
+          object_getClassName(owner));
 }
 
 static id cs_workspaceInitWithOwner(id self, SEL _cmd, id owner) {
     id result = orig_workspaceInitWithOwner(self, _cmd, owner);
-    CSNoteWorkspace(result);
+    CSNoteWorkspace(result, owner);
     return result;
 }
 
@@ -92,17 +91,14 @@ static BOOL CSInstallWorkspaceCapture(void) {
     BOOL owner = CSSwizzleInstanceMethod(workspace, @selector(initWithOwner:),
                                          (IMP)cs_workspaceInitWithOwner,
                                          (IMP *)&orig_workspaceInitWithOwner);
-    BOOL plain = CSSwizzleInstanceMethod(workspace, @selector(init),
-                                         (IMP)cs_workspaceInit,
-                                         (IMP *)&orig_workspaceInit);
-    if (!owner && !plain) {
-        CSLog("WARNING: DBWorkspace has neither -initWithOwner: nor -init; "
+    if (!owner) {
+        CSLog("WARNING: DBWorkspace has no -initWithOwner:; "
               "carlaunch cannot reach the car workspace on this release");
         return NO;
     }
 
     installed = YES;
-    CSLog("workspace capture installed (initWithOwner=%d init=%d)", owner, plain);
+    CSLog("dashboard workspace capture installed (initWithOwner=%d)", owner);
     return YES;
 }
 
@@ -163,6 +159,22 @@ static void CSCarLaunch(NSString *bundleID) {
     ((void (*)(id, SEL, id))objc_msgSend)(request, activateSelector, application);
     ((void (*)(id, SEL, id))objc_msgSend)(workspace, changeSelector, request);
     CSLog("carlaunch %s: activation requested", bundleID.UTF8String);
+    __weak id requestedWorkspace = workspace;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        id liveWorkspace = requestedWorkspace;
+        SEL stateSelector = @selector(state);
+        SEL activeSelector = @selector(activeBundleIdentifier);
+        if (![liveWorkspace respondsToSelector:stateSelector]) return;
+        id state = ((id (*)(id, SEL))objc_msgSend)(liveWorkspace, stateSelector);
+        if (![state respondsToSelector:activeSelector]) {
+            CSLog("carlaunch %s: dashboard active app unavailable", bundleID.UTF8String);
+            return;
+        }
+        NSString *active = ((id (*)(id, SEL))objc_msgSend)(state, activeSelector);
+        CSLog("carlaunch %s: dashboard active=%s matched=%d", bundleID.UTF8String,
+              active.UTF8String ?: "nil", [active isEqualToString:bundleID]);
+    });
 }
 
 void CSInstallCarLaunch(void) {
