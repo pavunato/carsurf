@@ -8,8 +8,8 @@ CarBridge stopped at iOS 13 because CarPlay's UI moved out of SpringBoard
 into its own process and the entitlement gate moved into
 `CarPlaySupport.framework`. This is a fresh implementation, not a port.
 
-Measured working on iOS 18.5 (iPhone 11, rootless) and iOS 16.7.12 (iPhone X,
-RootHide).
+Measured working on iOS 18.5 (iPhone 11, rootless), iOS 16.7.12 (iPhone X,
+RootHide), iOS 17.0 (iPhone 13, Dopamine).
 
 ## What it does
 
